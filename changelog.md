@@ -1,3 +1,12 @@
+# WireGuard KSU v1.1.1
+
+- Fix boot autostart with domain endpoints on slow network startup (#1)
+- Wait for a physical underlay route and DNS before starting interfaces at boot
+- Use `/data/adb/wireguard/wgksu` as a boot-time fallback when `wgksu` is not in `PATH`
+- Fix endpoint DNS parsing so `nslookup` server addresses are not mistaken for peer endpoints
+- Repair running endpoint routes after Wi-Fi/mobile network route rebuilds
+- Suppress harmless `ndc resolver setnetdns` output from the WebUI error log
+
 # WireGuard KSU v1.1.0
 
 - Per-interface autostart control

@@ -27,6 +27,7 @@
 - 开机自动启动所有配置的接口
 - KSU 模块列表显示运行状态和 IP
 - Endpoint 自动钉扎到底层物理网络，避免外层 WireGuard UDP 流量被其他 VPN/TUN 路由接管
+- 网络重建后自动修复 Endpoint 路由，改善 Wi-Fi/移动网络切换后的恢复速度
 - 可选 Stay Awake 模式，在息屏时保持 WireGuard 可达（会增加耗电）
 
 ## 前提条件
@@ -85,9 +86,11 @@ PersistentKeepalive = 25
 
 ### Endpoint 路由钉扎
 
-模块启动接口时会为 Peer `Endpoint` 添加更具体的 host route，让 WireGuard 外层 UDP 流量走物理网络（优先 `wlan`，其次 `eth`，再其次移动网络），避免设备上同时存在其他 Android VPN/TUN 时把 WireGuard endpoint 套进另一个隧道。
+模块启动接口时会等待可用的物理网络和 DNS，然后为 Peer `Endpoint` 添加更具体的 host route，让 WireGuard 外层 UDP 流量走物理网络（优先 `wlan`，其次 `eth`，再其次移动网络），避免设备上同时存在其他 Android VPN/TUN 时把 WireGuard endpoint 套进另一个隧道。
 
-如果网络在息屏后被系统重建，模块会在 DNS re-resolve 循环中重新钉扎 endpoint route。该循环不是事件驱动，默认间隔为 120 秒，因此极端情况下恢复可能有最多约 120 秒延迟。可在 WebUI 的 DNS re-resolve 设置中调低间隔，但更短间隔会增加息屏唤醒和 DNS 查询频率。
+如果网络在息屏、Wi-Fi 开关、移动网络切换等场景中被系统重建，模块会对运行中的接口定期检查当前 peer endpoint 的底层路由，并在路由丢失或指向错误设备时重新钉扎。该轻量检查默认约 30 秒一次，不做 DNS 查询。
+
+对于域名 Endpoint，模块仍会通过 DNS re-resolve 循环处理域名解析结果变化。该循环默认间隔为 120 秒，可在 WebUI 的 DNS re-resolve 设置中调低；更短间隔会增加息屏唤醒和 DNS 查询频率。
 
 ### 息屏保持可达
 
