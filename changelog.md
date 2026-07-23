@@ -4,6 +4,7 @@
 - Fall back to a compatible system `flock` and fail interface startup safely when locking is unavailable
 - Tolerate delayed lock-holder startup and retry transient boot-time start failures
 - Make the monitored holder process own the lock file descriptor directly
+- Preserve the lock file descriptor by running lock holders with the framework BusyBox shell
 - Pin wireguard-tools builds and verify release package contents
 
 # WireGuard KSU v1.1.1

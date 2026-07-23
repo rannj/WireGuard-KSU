@@ -2,11 +2,20 @@
 
 case "${1:-}" in
   --list)
-    echo flock
+    printf '%s\n' flock sh
     ;;
   flock)
     shift
+    if [ "${WGKSU_TEST_BUSYBOX_SH:-0}" != "1" ]; then
+      echo "flock was not launched through BusyBox sh" >&2
+      exit 1
+    fi
     exec flock "$@"
+    ;;
+  sh)
+    shift
+    export WGKSU_TEST_BUSYBOX_SH=1
+    exec sh "$@"
     ;;
   *)
     echo "Unsupported test BusyBox applet: ${1:-}" >&2

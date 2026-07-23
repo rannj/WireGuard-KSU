@@ -166,10 +166,12 @@ endpoint_routes_flock_available() {
   flock_probe="$wg_data/.endpoint-routes.flock-probe.$$"
 
   if "$busybox" --list 2>/dev/null | grep -qx flock; then
-    if (
-      exec 9>>"$flock_probe"
-      "$busybox" flock -n 9
-    ) >/dev/null 2>&1; then
+    # $1 and $2 are expanded by the child BusyBox shell.
+    # shellcheck disable=SC2016
+    if "$busybox" sh -c '
+      exec 9>>"$1" || exit 1
+      "$2" flock -n 9
+    ' sh "$flock_probe" "$busybox" >/dev/null 2>&1; then
       rm -f "$flock_probe"
       endpoint_routes_flock_backend="busybox"
       return 0
@@ -178,10 +180,12 @@ endpoint_routes_flock_available() {
 
   system_flock=$(command -v flock 2>/dev/null)
   if [ -n "$system_flock" ]; then
-    if (
-      exec 9>>"$flock_probe"
-      "$system_flock" -n 9
-    ) >/dev/null 2>&1; then
+    # $1 and $2 are expanded by the child BusyBox shell.
+    # shellcheck disable=SC2016
+    if "$busybox" sh -c '
+      exec 9>>"$1" || exit 1
+      "$2" -n 9
+    ' sh "$flock_probe" "$system_flock" >/dev/null 2>&1; then
       rm -f "$flock_probe"
       endpoint_routes_flock_backend="system"
       endpoint_routes_system_flock="$system_flock"
@@ -298,7 +302,7 @@ acquire_endpoint_routes_lock() {
         return 1
         ;;
     esac
-    sh "$wgksu_self" endpoint-route-lock-holder \
+    "$busybox" sh "$wgksu_self" endpoint-route-lock-holder \
       "$endpoint_routes_flock_backend" "$flock_command" "$lock_file" \
       "$$" "$parent_start_time" "$ready_file" "$hold_file" &
     holder_pid=$!
