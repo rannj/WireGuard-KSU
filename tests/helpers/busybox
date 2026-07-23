@@ -1,0 +1,15 @@
+#!/bin/sh
+
+case "${1:-}" in
+  --list)
+    echo flock
+    ;;
+  flock)
+    shift
+    exec flock "$@"
+    ;;
+  *)
+    echo "Unsupported test BusyBox applet: ${1:-}" >&2
+    exit 127
+    ;;
+esac

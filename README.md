@@ -36,6 +36,10 @@
 
 大多数运行 KernelSU 的内核（Linux 5.6+）都已内置支持。
 
+Endpoint 路由锁需要支持文件描述符模式的 `flock`。模块优先使用
+Magisk/KernelSU/APatch 的 BusyBox applet，也会自动尝试系统提供的兼容实现；
+如果两者都不可用，接口启动会明确失败，而不会在未钉扎 Endpoint 路由的情况下继续。
+
 ## 安装
 
 1. 从 [Releases](../../releases) 下载 zip

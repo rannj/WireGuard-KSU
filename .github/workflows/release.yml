@@ -24,7 +24,9 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Install tools
-        run: sudo apt-get update && sudo apt-get install -y g++-aarch64-linux-gnu
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git make file shellcheck zip unzip g++-aarch64-linux-gnu
 
       - name: Read module metadata
         id: meta
@@ -38,29 +40,17 @@ jobs:
           echo "package_name=${package_name}" >> "$GITHUB_OUTPUT"
           echo "release_name=WireGuard KSU ${module_version}" >> "$GITHUB_OUTPUT"
 
-      - name: Validate shell scripts
-        run: |
-          sh -n customize.sh
-          sh -n boot-completed.sh
-          sh -n uninstall.sh
-          sh -n wgksu
+      - name: Validate and test
+        run: sh scripts/ci/validate.sh
 
       - name: Build wg tool for aarch64
-        run: |
-          git clone --depth 1 https://git.zx2c4.com/wireguard-tools /tmp/wg-build
-          cd /tmp/wg-build/src
-          make -j"$(nproc)" CC=aarch64-linux-gnu-gcc LDFLAGS="-static" PLATFORM=linux wg
-          aarch64-linux-gnu-strip wg
-          cp wg "$GITHUB_WORKSPACE/wg"
+        run: sh scripts/ci/build-wg.sh
 
       - name: Create release package
-        run: |
-          mkdir -p dist
-          zip -qr "dist/${{ steps.meta.outputs.package_name }}" \
-            META-INF webroot \
-            boot-completed.sh customize.sh uninstall.sh \
-            wgksu wg wg0.conf.example \
-            module.prop
+        run: sh scripts/ci/package-module.sh "dist/${{ steps.meta.outputs.package_name }}"
+
+      - name: Verify package contents
+        run: sh scripts/ci/verify-package.sh "dist/${{ steps.meta.outputs.package_name }}"
 
       - name: Generate update JSON
         run: |

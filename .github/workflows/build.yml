@@ -16,7 +16,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y shellcheck unzip g++-aarch64-linux-gnu
+          sudo apt-get install -y git make file shellcheck zip unzip g++-aarch64-linux-gnu
 
       - name: Read module metadata
         id: meta
@@ -26,45 +26,17 @@ jobs:
           echo "module_version=${module_version}" >> "$GITHUB_OUTPUT"
           echo "package_name=${package_name}" >> "$GITHUB_OUTPUT"
 
-      - name: Validate shell scripts
-        run: |
-          sh -n customize.sh
-          sh -n boot-completed.sh
-          sh -n uninstall.sh
-          sh -n wgksu
-          shellcheck customize.sh
-          shellcheck boot-completed.sh
-          shellcheck uninstall.sh
-          shellcheck wgksu
+      - name: Validate and test
+        run: sh scripts/ci/validate.sh
 
       - name: Build wg tool for aarch64
-        run: |
-          git clone --depth 1 https://git.zx2c4.com/wireguard-tools /tmp/wg-build
-          cd /tmp/wg-build/src
-          make -j"$(nproc)" CC=aarch64-linux-gnu-gcc LDFLAGS="-static" PLATFORM=linux wg
-          aarch64-linux-gnu-strip wg
-          file wg
-          cp wg "$GITHUB_WORKSPACE/wg"
+        run: sh scripts/ci/build-wg.sh
 
       - name: Create module package
-        run: |
-          mkdir -p dist
-          zip -qr "dist/${{ steps.meta.outputs.package_name }}" \
-            META-INF webroot \
-            boot-completed.sh customize.sh uninstall.sh \
-            wgksu wg wg0.conf.example \
-            module.prop
+        run: sh scripts/ci/package-module.sh "dist/${{ steps.meta.outputs.package_name }}"
 
       - name: Verify package contents
-        run: |
-          unzip -Z -1 "dist/${{ steps.meta.outputs.package_name }}" | tee package-list.txt
-          for path in META-INF/com/google/android/update-binary META-INF/com/google/android/updater-script \
-            webroot/index.html boot-completed.sh customize.sh uninstall.sh wgksu wg module.prop; do
-            grep -Fxq "$path" package-list.txt || { echo "Missing: $path"; exit 1; }
-          done
-          for pattern in '^\\.git/' '^\\.github/' '^README\\.md$' '^LICENSE$'; do
-            grep -Eq "$pattern" package-list.txt && { echo "Forbidden: $pattern"; exit 1; } || true
-          done
+        run: sh scripts/ci/verify-package.sh "dist/${{ steps.meta.outputs.package_name }}"
 
       - name: Upload package artifact
         uses: actions/upload-artifact@v6

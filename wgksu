@@ -22,6 +22,15 @@ for bb in /data/adb/magisk/busybox /data/adb/ksu/bin/busybox /data/adb/ap/bin/bu
 done
 [ -z "$busybox" ] && busybox="busybox"
 
+if [ -n "${WGKSU_SELF:-}" ]; then
+  wgksu_self="$WGKSU_SELF"
+else
+  case "$0" in
+    /*) wgksu_self="$0" ;;
+    *) wgksu_self=$(command -v "$0" 2>/dev/null || echo "$0") ;;
+  esac
+fi
+
 get_autostart() {
   iface="$1"
   if [ -n "$iface" ] && [ -f "$wg_data/autostart.${iface}" ]; then
@@ -139,25 +148,212 @@ endpoint_routes_lock_dir() {
   echo "$wg_data/endpoint-routes.$1.lock"
 }
 
+endpoint_routes_lock_file() {
+  echo "$wg_data/endpoint-routes.$1.lock.fd"
+}
+
+endpoint_routes_lock_active=0
+endpoint_routes_lock_holder_pid=""
+endpoint_routes_lock_hold_file=""
+endpoint_routes_lock_ready_file=""
+endpoint_routes_flock_backend=""
+endpoint_routes_system_flock=""
+
+endpoint_routes_flock_available() {
+  endpoint_routes_flock_backend=""
+  endpoint_routes_system_flock=""
+  mkdir -p "$wg_data"
+  flock_probe="$wg_data/.endpoint-routes.flock-probe.$$"
+
+  if "$busybox" --list 2>/dev/null | grep -qx flock; then
+    if (
+      exec 9>>"$flock_probe"
+      "$busybox" flock -n 9
+    ) >/dev/null 2>&1; then
+      rm -f "$flock_probe"
+      endpoint_routes_flock_backend="busybox"
+      return 0
+    fi
+  fi
+
+  system_flock=$(command -v flock 2>/dev/null)
+  if [ -n "$system_flock" ]; then
+    if (
+      exec 9>>"$flock_probe"
+      "$system_flock" -n 9
+    ) >/dev/null 2>&1; then
+      rm -f "$flock_probe"
+      endpoint_routes_flock_backend="system"
+      endpoint_routes_system_flock="$system_flock"
+      return 0
+    fi
+  fi
+  rm -f "$flock_probe"
+  return 1
+}
+
+require_endpoint_routes_lock() {
+  iface="$1"
+  if endpoint_routes_flock_available; then
+    return 0
+  fi
+
+  lock_error="no compatible flock implementation; refusing to start without endpoint route locking"
+  wg_log "$iface" "$lock_error"
+  echo "ERROR: $lock_error for $iface"
+  return 1
+}
+
+endpoint_routes_lock_holder() {
+  holder_flock_backend="$1"
+  holder_flock_command="$2"
+  holder_lock_file="$3"
+  holder_parent_pid="$4"
+  holder_parent_start_time="$5"
+  holder_ready_file="$6"
+  holder_hold_file="$7"
+
+  if ! exec 9>>"$holder_lock_file"; then
+    return 1
+  fi
+  case "$holder_flock_backend" in
+    busybox) "$holder_flock_command" flock -n 9 ;;
+    system) "$holder_flock_command" -n 9 ;;
+    *) return 1 ;;
+  esac || return 1
+
+  cleanup_endpoint_routes_lock_holder() {
+    rm -f "$holder_ready_file" "$holder_hold_file" 9>&-
+  }
+  trap cleanup_endpoint_routes_lock_holder 0
+  trap 'exit 129' 1
+  trap 'exit 130' 2
+  trap 'exit 143' 15
+
+  holder_current_start_time=$(awk '{ print $22 }' "/proc/$holder_parent_pid/stat" 2>/dev/null 9>&-)
+  [ "$holder_current_start_time" = "$holder_parent_start_time" ] || return 1
+  : > "$holder_ready_file"
+
+  while [ -f "$holder_hold_file" ]; do
+    holder_current_start_time=$(awk '{ print $22 }' "/proc/$holder_parent_pid/stat" 2>/dev/null 9>&-)
+    [ "$holder_current_start_time" = "$holder_parent_start_time" ] || break
+    sleep 0.5 9>&-
+  done
+}
+
+release_endpoint_routes_lock() {
+  trap - 0 1 2 15
+
+  [ "$endpoint_routes_lock_active" = "1" ] || return 0
+  endpoint_routes_lock_active=0
+  rm -f "$endpoint_routes_lock_hold_file"
+  if [ -n "$endpoint_routes_lock_holder_pid" ]; then
+    wait "$endpoint_routes_lock_holder_pid" 2>/dev/null || true
+  fi
+  rm -f "$endpoint_routes_lock_ready_file"
+  endpoint_routes_lock_holder_pid=""
+  endpoint_routes_lock_hold_file=""
+  endpoint_routes_lock_ready_file=""
+}
+
+arm_endpoint_routes_lock_cleanup() {
+  trap 'exit 129' 1
+  trap 'exit 130' 2
+  trap 'exit 143' 15
+  trap 'release_endpoint_routes_lock' 0
+}
+
 acquire_endpoint_routes_lock() {
   iface="$1"
-  lock_dir=$(endpoint_routes_lock_dir "$iface")
+  lock_file=$(endpoint_routes_lock_file "$iface")
+  hold_file="${lock_file}.hold.$$"
+  ready_file="${lock_file}.ready.$$"
   tries=0
+  mkdir -p "$wg_data"
 
-  while ! mkdir "$lock_dir" 2>/dev/null; do
+  if ! endpoint_routes_flock_available; then
+    wg_log "$iface" "no compatible flock implementation for endpoint route lock"
+    return 1
+  fi
+  parent_start_time=$(awk '{ print $22 }' "/proc/$$/stat" 2>/dev/null)
+  if [ -z "$parent_start_time" ]; then
+    wg_log "$iface" "failed to read endpoint route lock owner identity"
+    return 1
+  fi
+  if ! : >> "$lock_file"; then
+    wg_log "$iface" "failed to create endpoint route lock file"
+    return 1
+  fi
+  chmod 600 "$lock_file" 2>/dev/null
+
+  rm -f "$ready_file"
+  : > "$hold_file"
+  while :; do
+    case "$endpoint_routes_flock_backend" in
+      busybox) flock_command="$busybox" ;;
+      system) flock_command="$endpoint_routes_system_flock" ;;
+      *)
+        rm -f "$hold_file"
+        wg_log "$iface" "invalid endpoint route lock backend"
+        return 1
+        ;;
+    esac
+    sh "$wgksu_self" endpoint-route-lock-holder \
+      "$endpoint_routes_flock_backend" "$flock_command" "$lock_file" \
+      "$$" "$parent_start_time" "$ready_file" "$hold_file" &
+    holder_pid=$!
+
+    holder_wait_tries=0
+    while [ ! -f "$ready_file" ] && kill -0 "$holder_pid" 2>/dev/null; do
+      holder_wait_tries=$((holder_wait_tries + 1))
+      # Process launches can be slow while Android is finishing boot. Keep a
+      # finite deadline so a wedged holder still cannot block startup forever.
+      [ "$holder_wait_tries" -lt 50 ] || break
+      sleep 0.1
+    done
+
+    if [ -f "$ready_file" ]; then
+      break
+    fi
+    if kill -0 "$holder_pid" 2>/dev/null; then
+      rm -f "$hold_file"
+      kill "$holder_pid" 2>/dev/null || true
+      wait "$holder_pid" 2>/dev/null || true
+      rm -f "$ready_file"
+      wg_log "$iface" "endpoint route lock holder failed to initialize"
+      return 1
+    fi
+    wait "$holder_pid" 2>/dev/null || true
+
     tries=$((tries + 1))
     if [ "$tries" -ge 10 ]; then
+      rm -f "$hold_file"
+      rm -f "$ready_file"
       wg_log "$iface" "timed out waiting for endpoint route lock"
       return 1
     fi
     sleep 1
   done
 
-  echo "$lock_dir"
+  endpoint_routes_lock_active=1
+  endpoint_routes_lock_holder_pid="$holder_pid"
+  endpoint_routes_lock_hold_file="$hold_file"
+  endpoint_routes_lock_ready_file="$ready_file"
+  arm_endpoint_routes_lock_cleanup
+  return 0
 }
 
-release_endpoint_routes_lock() {
-  [ -n "$1" ] && rmdir "$1" 2>/dev/null
+cleanup_boot_endpoint_routes_locks() {
+  # Migrate directory locks written by versions before v1.1.2. No process
+  # from an earlier boot can still own them, including partial owner files.
+  for cleanup_lock_dir in "$wg_data"/endpoint-routes.*.lock \
+                          "$wg_data"/endpoint-routes.*.lock.reclaim; do
+    [ -d "$cleanup_lock_dir" ] || continue
+    rm -f "$cleanup_lock_dir/owner"
+    if rmdir "$cleanup_lock_dir" 2>/dev/null; then
+      wg_log boot "removed legacy endpoint route lock $(basename "$cleanup_lock_dir")"
+    fi
+  done
 }
 
 endpoint_host() {
@@ -346,7 +542,7 @@ refresh_endpoint_routes() {
   iface="$2"
   old_routes=$(endpoint_routes_file "$iface")
   new_routes="${old_routes}.tmp"
-  lock_dir=$(acquire_endpoint_routes_lock "$iface") || return
+  acquire_endpoint_routes_lock "$iface" || return
 
   mkdir -p "$wg_data"
   : > "$new_routes"
@@ -373,8 +569,14 @@ refresh_endpoint_routes() {
   done
 
   delete_stale_endpoint_routes "$old_routes" "$new_routes"
-  mv "$new_routes" "$old_routes"
-  release_endpoint_routes_lock "$lock_dir"
+  if ! mv "$new_routes" "$old_routes"; then
+    wg_log "$iface" "failed to save endpoint routes"
+    rm -f "$new_routes"
+    release_endpoint_routes_lock
+    return 1
+  fi
+  release_endpoint_routes_lock
+  return 0
 }
 
 repair_endpoint_routes() {
@@ -387,21 +589,21 @@ repair_endpoint_routes() {
 
     old_routes=$(endpoint_routes_file "$iface")
     new_routes="${old_routes}.tmp"
-    lock_dir=$(acquire_endpoint_routes_lock "$iface") || continue
+    acquire_endpoint_routes_lock "$iface" || continue
     mkdir -p "$wg_data"
     : > "$new_routes"
     add_runtime_endpoint_routes "$iface" "$new_routes" 1
     delete_stale_endpoint_routes "$old_routes" "$new_routes"
     mv "$new_routes" "$old_routes"
-    release_endpoint_routes_lock "$lock_dir"
+    release_endpoint_routes_lock
   done
 }
 
 remove_endpoint_routes() {
   iface="$1"
   routes_file=$(endpoint_routes_file "$iface")
-  lock_dir=$(acquire_endpoint_routes_lock "$iface") || return
-  [ -f "$routes_file" ] || { release_endpoint_routes_lock "$lock_dir"; return; }
+  acquire_endpoint_routes_lock "$iface" || return
+  [ -f "$routes_file" ] || { release_endpoint_routes_lock; return; }
   while read -r family endpoint_addr; do
     [ -n "$family" ] || continue
     if [ -z "$endpoint_addr" ]; then
@@ -415,7 +617,7 @@ remove_endpoint_routes() {
     fi
   done < "$routes_file"
   rm -f "$routes_file"
-  release_endpoint_routes_lock "$lock_dir"
+  release_endpoint_routes_lock
 }
 
 # --- wg-quick replacement for Android (sh-based) ---
@@ -452,6 +654,7 @@ wg_up() {
     echo "ERROR: missing [Peer] section in $conf"
     return 1
   fi
+  require_endpoint_routes_lock "$iface" || return 1
 
   # extract Interface fields
   address=$(grep -i '^[[:space:]]*Address' "$conf" | sed 's/^[^=]*= *//' | tr -d ' ')
@@ -468,6 +671,8 @@ wg_up() {
 
   # apply wg config (strip Interface-only fields, pass to wg setconf)
   tmpconf="/tmp/wg_${iface}.conf"
+  # Backslash continuations below are part of the single-quoted awk program.
+  # shellcheck disable=SC1004
   awk '
     { gsub(/\r/, "") }
     /^[[:space:]]*\[/ { print; next }
@@ -502,7 +707,13 @@ wg_up() {
   done < "$tmpconf" > "${tmpconf}.resolved"
   mv "${tmpconf}.resolved" "$tmpconf"
 
-  refresh_endpoint_routes "$tmpconf" "$iface"
+  if ! refresh_endpoint_routes "$tmpconf" "$iface"; then
+    rm -f "$tmpconf"
+    wg_log "$iface" "failed to prepare endpoint routes; interface startup aborted"
+    echo "ERROR: failed to prepare endpoint routes for $iface"
+    ip link del "$iface" 2>/dev/null
+    return 1
+  fi
 
   $WG setconf "$iface" "$tmpconf" 2>>"$log_file"
   wg_setconf_ret=$?
@@ -621,13 +832,15 @@ update_desc() {
 # --- commands ---
 start_all() {
   started=0
+  start_status=0
   for conf in "$wg_data"/*.conf; do
     [ -f "$conf" ] || continue
     iface=$(basename "$conf" .conf)
-    wg_up "$conf" "$iface"
+    wg_up "$conf" "$iface" || start_status=1
     started=1
   done
   [ "$started" = "0" ] && echo "No .conf files found in $wg_data"
+  return "$start_status"
 }
 
 stop_all() {
@@ -735,7 +948,10 @@ reresolve_dns() {
     iface=$(basename "$conf" .conf)
     [ -n "$filter" ] && [ "$filter" != "$iface" ] && continue
     iface_running "$iface" || continue
-    refresh_endpoint_routes "$conf" "$iface"
+    if ! refresh_endpoint_routes "$conf" "$iface"; then
+      wg_log "$iface" "skipping DNS endpoint update because endpoint routes could not be locked"
+      continue
+    fi
 
     # parse each peer's public key and endpoint from conf
     awk '
@@ -769,14 +985,19 @@ reresolve_dns() {
 }
 
 case "$1" in
+  endpoint-route-lock-holder)
+    endpoint_routes_lock_holder "$2" "$3" "$4" "$5" "$6" "$7" "$8"
+    ;;
   start)
+    command_status=0
     if [ -n "$2" ]; then
-      wg_up "$wg_data/$2.conf" "$2"
+      wg_up "$wg_data/$2.conf" "$2" || command_status=$?
     else
-      start_all
+      start_all || command_status=$?
     fi
     apply_stay_awake_runtime
     update_desc
+    exit "$command_status"
     ;;
   stop)
     if [ -n "$2" ]; then
@@ -788,13 +1009,17 @@ case "$1" in
     update_desc
     ;;
   restart)
+    command_status=0
     if [ -n "$2" ]; then
-      wg_down "$2"; wg_up "$wg_data/$2.conf" "$2"
+      wg_down "$2"
+      wg_up "$wg_data/$2.conf" "$2" || command_status=$?
     else
-      stop_all; start_all
+      stop_all
+      start_all || command_status=$?
     fi
     apply_stay_awake_runtime
     update_desc
+    exit "$command_status"
     ;;
   status)  show_status ;;
   enable)  set_autostart 1 "$2"; echo "boot auto start: enabled${2:+ ($2)}" ;;
@@ -842,6 +1067,9 @@ case "$1" in
     ;;
   repair-routes)
     repair_endpoint_routes "$2"
+    ;;
+  cleanup-route-locks)
+    cleanup_boot_endpoint_routes_locks
     ;;
   reresolve-log)
     tail -50 "$reresolve_log" 2>/dev/null || echo "No re-resolve log"

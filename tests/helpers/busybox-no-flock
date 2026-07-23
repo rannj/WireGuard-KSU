@@ -1,0 +1,11 @@
+#!/bin/sh
+
+case "${1:-}" in
+  --list)
+    echo sh
+    ;;
+  *)
+    echo "Unsupported test BusyBox applet: ${1:-}" >&2
+    exit 127
+    ;;
+esac

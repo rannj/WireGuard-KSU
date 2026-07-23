@@ -1,0 +1,18 @@
+#!/bin/sh
+
+case "${1:-}" in
+  start)
+    count=0
+    [ ! -f "$WGKSU_TEST_COUNT_FILE" ] ||
+      count=$(cat "$WGKSU_TEST_COUNT_FILE")
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$WGKSU_TEST_COUNT_FILE"
+    [ "$count" -gt 1 ]
+    ;;
+  status)
+    exit 0
+    ;;
+  *)
+    exit 2
+    ;;
+esac

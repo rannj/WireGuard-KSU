@@ -173,18 +173,38 @@ start_iface_when_ready() {
 
   while [ "$attempts" -lt "$max_attempts" ]; do
     if boot_network_ready "$conf"; then
-      [ "$attempts" -gt 0 ] && boot_log "$iface: network ready after $((attempts * 5))s"
-      "$WGKSU" start "$iface" >> "$log_file" 2>&1
-      "$WGKSU" status >/dev/null 2>&1
-      return
+      [ "$attempts" -gt 0 ] &&
+        boot_log "$iface: network ready after $((attempts * 5))s"
+      break
     fi
 
-    [ "$attempts" = "0" ] && boot_log "$iface: waiting for physical network and DNS before autostart"
+    [ "$attempts" = "0" ] &&
+      boot_log "$iface: waiting for physical network and DNS before autostart"
     attempts=$((attempts + 1))
     sleep 5
   done
 
-  boot_log "$iface: network not ready after $((max_attempts * 5))s; skipped autostart"
+  if [ "$attempts" -ge "$max_attempts" ]; then
+    boot_log "$iface: network not ready after $((max_attempts * 5))s; skipped autostart"
+    return 1
+  fi
+
+  start_attempts=0
+  max_start_attempts=3
+  while [ "$start_attempts" -lt "$max_start_attempts" ]; do
+    if "$WGKSU" start "$iface" >> "$log_file" 2>&1; then
+      "$WGKSU" status >/dev/null 2>&1
+      return 0
+    fi
+
+    start_attempts=$((start_attempts + 1))
+    if [ "$start_attempts" -ge "$max_start_attempts" ]; then
+      boot_log "$iface: failed to start after $start_attempts attempts"
+      return 1
+    fi
+    boot_log "$iface: start failed; retrying in 5s ($start_attempts/$max_start_attempts)"
+    sleep 5
+  done
 }
 
 (
@@ -192,6 +212,10 @@ start_iface_when_ready() {
     sleep 5
   done
   sleep 5
+
+  # No lock owner can survive a reboot. Remove locks from older versions or
+  # dead owners before starting any interface workers for this boot.
+  "$WGKSU" cleanup-route-locks >> "$log_file" 2>&1
 
   # start interfaces with autostart enabled (per-interface)
   started=0

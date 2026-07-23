@@ -1,0 +1,4 @@
+#!/bin/sh
+
+sleep "${WGKSU_TEST_HOLDER_DELAY:?}"
+exec sh "${WGKSU_TEST_REAL_HOLDER:?}" "$@"
