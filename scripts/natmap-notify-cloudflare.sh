@@ -27,10 +27,10 @@ is_ipv4 "$public_addr" || {
 case "$public_port" in
   ''|*[!0-9]*) echo "NATMap returned an invalid public port: $public_port" >&2; exit 2 ;;
 esac
-[ "$public_port" -ge 1 ] && [ "$public_port" -le 65535 ] || {
+if [ "$public_port" -lt 1 ] || [ "$public_port" -gt 65535 ]; then
   echo "NATMap public port is outside 1..65535: $public_port" >&2
   exit 2
-}
+fi
 
 : "${CF_API_TOKEN:?set CF_API_TOKEN in $config_file}"
 : "${CF_ZONE_ID:?set CF_ZONE_ID in $config_file}"
