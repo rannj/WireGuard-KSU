@@ -1083,6 +1083,7 @@ prepare_dynamic_endpoint_config() {
     END { if (peer && pk && ep && fb) print n "|" pk "|" ep "|" fb }
   ' "$input" > "$peers"
   : > "$choices"
+  selection_failed=0
 
   while IFS='|' read -r n pubkey endpoint fallback; do
     [ -n "$n" ] || continue
@@ -1090,13 +1091,17 @@ prepare_dynamic_endpoint_config() {
     native_port=$(endpoint_port "$endpoint")
     choice=$(select_dynamic_candidate "$native_host" "$native_port" "$fallback" "") || {
       wg_log "$iface" "no usable dynamic endpoint for peer $pubkey"
-      rm -f "$peers" "$choices"
-      return 1
+      selection_failed=1
+      break
     }
     state=${choice%%|*}
     candidate=${choice#*|}
     printf '%s|%s|%s|%s|%s|%s|%s\n' "$n" "$pubkey" "$state" "$candidate" "$native_host" "$fallback" "$native_port" >> "$choices"
   done < "$peers"
+  if [ "$selection_failed" = "1" ]; then
+    rm -f "$peers" "$choices"
+    return 1
+  fi
 
   if [ -s "$choices" ]; then
     awk -F'|' '
