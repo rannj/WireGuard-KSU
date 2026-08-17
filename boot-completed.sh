@@ -139,6 +139,14 @@ resolve_host() {
 
 boot_network_ready() {
   conf="$1"
+
+  # Dynamic peers can start on either family. wgksu performs the authoritative
+  # IPv6 probe / TXT lookup and will retry startup if DNS is not ready yet.
+  if grep -qi '^[[:space:]]*EndpointFallbackTXT[[:space:]]*=' "$conf" 2>/dev/null; then
+    underlay_default_ready 6 || underlay_default_ready 4
+    return $?
+  fi
+
   endpoints=$(grep -i '^[[:space:]]*Endpoint[[:space:]]*=' "$conf" 2>/dev/null | sed 's/^[^=]*= *//' | tr -d ' ')
 
   [ -z "$endpoints" ] && return 0

@@ -7,6 +7,7 @@ stay_awake_wakelock_state="$wg_data/stayawake.wakelock"
 stay_awake_wifi_state="$wg_data/stayawake.wifi"
 log_file="$wg_data/error.log"
 reresolve_log="$wg_data/reresolve.log"
+dynamic_endpoint_log="$wg_data/dynamic-endpoint.log"
 wake_lock_name="wgksu_stay_awake"
 
 # resolve wg binary path: prefer PATH, fallback to data dir
@@ -495,7 +496,7 @@ add_endpoint_route() {
   route=$(get_underlay_default_route "$family")
   if [ -z "$route" ]; then
     [ "$quiet_no_route" = "1" ] || wg_log "$iface" "no IPv${family} physical default route available for endpoint $endpoint_addr"
-    return
+    return 1
   fi
 
   via=$(echo "$route" | awk '{print $2}')
@@ -555,8 +556,14 @@ refresh_endpoint_routes() {
     add_runtime_endpoint_routes "$iface" "$new_routes" 1
   fi
 
-  grep -i '^[[:space:]]*Endpoint[[:space:]]*=' "$conf" | while IFS= read -r line; do
-    endpoint=$(echo "$line" | sed 's/^[^=]*= *//')
+  awk '
+    { gsub(/\r/, "") }
+    /^\[Peer\]/ { if (peer && ep && !fb) print ep; peer=1; ep=""; fb=0; next }
+    /^\[/ { if (peer && ep && !fb) print ep; peer=0; next }
+    peer && /^[[:space:]]*Endpoint[[:space:]]*=/ { sub(/^[^=]*=[[:space:]]*/, ""); ep=$0 }
+    peer && /^[[:space:]]*EndpointFallbackTXT[[:space:]]*=/ { fb=1 }
+    END { if (peer && ep && !fb) print ep }
+  ' "$conf" | while IFS= read -r endpoint; do
     host=$(endpoint_host "$endpoint")
     if is_ipv4 "$host"; then
       add_endpoint_route 4 "$iface" "$host" "$new_routes"
@@ -590,6 +597,16 @@ repair_endpoint_routes() {
     iface=$(basename "$conf" .conf)
     [ -n "$filter" ] && [ "$filter" != "$iface" ] && continue
     iface_running "$iface" || continue
+
+    signature=$(underlay_network_signature)
+    signature_file=$(network_signature_file "$iface")
+    previous_signature=$(cat "$signature_file" 2>/dev/null)
+    if [ "$signature" != "$previous_signature" ]; then
+      wg_log "$iface" "underlying default network changed; running IPv6-first endpoint selection"
+      if refresh_dynamic_endpoints "$iface" 1; then
+        printf '%s\n' "$signature" > "$signature_file"
+      fi
+    fi
 
     old_routes=$(endpoint_routes_file "$iface")
     new_routes="${old_routes}.tmp"
@@ -658,6 +675,18 @@ wg_up() {
     echo "ERROR: missing [Peer] section in $conf"
     return 1
   fi
+  if grep -qi '^[[:space:]]*EndpointFallbackTXT[[:space:]]*=' "$conf" &&
+     ! awk '
+       /^[[:space:]]*AllowedIPs[[:space:]]*=/ {
+         sub(/^[^=]*=[[:space:]]*/, "")
+         gsub(/,/, " ")
+         for (i = 1; i <= NF; i++) if ($i == "0.0.0.0/0" || $i ~ /:/) exit 1
+       }
+     ' "$conf"; then
+    wg_log "$iface" "dynamic endpoint requires IPv4 split-tunnel AllowedIPs"
+    echo "ERROR: EndpointFallbackTXT peers cannot use IPv6 or 0.0.0.0/0 AllowedIPs"
+    return 1
+  fi
   require_endpoint_routes_lock "$iface" || return 1
 
   # extract Interface fields
@@ -688,9 +717,18 @@ wg_up() {
       lk = tolower(key)
       if (lk == "privatekey" || lk == "listenport" || lk == "fwmark" || \
           lk == "publickey" || lk == "presharedkey" || lk == "allowedips" || \
-          lk == "endpoint" || lk == "persistentkeepalive") print
+          lk == "endpoint" || lk == "endpointfallbacktxt" || lk == "persistentkeepalive") print
     }
   ' "$conf" > "$tmpconf"
+
+  if ! prepare_dynamic_endpoint_config "$tmpconf" "${tmpconf}.dynamic" "$iface"; then
+    rm -f "$tmpconf" "${tmpconf}.dynamic"
+    wg_log "$iface" "dynamic endpoint selection failed; interface startup aborted"
+    echo "ERROR: failed to select dynamic endpoint for $iface"
+    ip link del "$iface" 2>/dev/null
+    return 1
+  fi
+  mv "${tmpconf}.dynamic" "$tmpconf"
 
   # pre-resolve domain endpoints (wg binary may not have working DNS)
   while IFS= read -r line; do
@@ -771,6 +809,7 @@ wg_up() {
 
   # routing policy
   ip rule add from all lookup main pref 1 2>/dev/null
+  save_underlay_network_signature "$iface"
 
   echo "$iface up"
 }
@@ -944,6 +983,211 @@ resolve_host() {
   resolve_host6 "$host"
 }
 
+dynamic_endpoint_state_file() {
+  echo "$wg_data/dynamic-endpoint.$1"
+}
+
+network_signature_file() {
+  echo "$wg_data/underlay-network.$1"
+}
+
+underlay_network_signature() {
+  route4=$(get_underlay_default_route 4)
+  route6=$(get_underlay_default_route 6)
+  printf '4=%s;6=%s\n' "$route4" "$route6"
+}
+
+save_underlay_network_signature() {
+  underlay_network_signature > "$(network_signature_file "$1")"
+}
+
+probe_native_ipv6() {
+  host="$1"
+  if ping -6 -c 1 -W 2 "$host" >/dev/null 2>&1; then
+    return 0
+  fi
+  command -v ping6 >/dev/null 2>&1 && ping6 -c 1 -W 2 "$host" >/dev/null 2>&1
+}
+
+resolve_txt() {
+  host="$1"
+  txt=""
+  if command -v dig >/dev/null 2>&1; then
+    txt=$(dig +short TXT "$host" 2>/dev/null | head -1)
+  fi
+  if [ -z "$txt" ]; then
+    txt=$($busybox nslookup -type=TXT "$host" 2>/dev/null | awk '
+      /text[[:space:]]*=/ { sub(/.*text[[:space:]]*=[[:space:]]*/, ""); print; exit }
+      /^[[:space:]]*[^;].*[[:space:]]TXT[[:space:]]/ { sub(/.*[[:space:]]TXT[[:space:]]+/, ""); print; exit }
+    ')
+  fi
+  if [ -z "$txt" ]; then
+    txt=$($busybox nslookup -query=TXT "$host" 2>/dev/null | awk '
+      /text[[:space:]]*=/ { sub(/.*text[[:space:]]*=[[:space:]]*/, ""); print; exit }
+      /^[[:space:]]*[^;].*[[:space:]]TXT[[:space:]]/ { sub(/.*[[:space:]]TXT[[:space:]]+/, ""); print; exit }
+    ')
+  fi
+  echo "$txt" | tr -d '"[:space:]'
+}
+
+parse_natmap_endpoint() {
+  value="$1"
+  addr=${value%:*}
+  port=${value##*:}
+  is_ipv4 "$addr" || return 1
+  case "$port" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$port" -ge 1 ] 2>/dev/null && [ "$port" -le 65535 ] 2>/dev/null || return 1
+  echo "${addr}:${port}"
+}
+
+select_dynamic_candidate() {
+  native_host="$1"
+  native_port="$2"
+  fallback_host="$3"
+  refresh_state="$4"
+
+  if [ "$refresh_state" = "NATIVE_V6" ] || { [ -z "$refresh_state" ] && probe_native_ipv6 "$native_host"; }; then
+    addr=$(resolve_host6 "$native_host")
+    if is_ipv6 "$addr"; then
+      printf 'NATIVE_V6|%s\n' "$(format_endpoint "$addr" "$native_port")"
+      return 0
+    fi
+    [ -n "$refresh_state" ] && return 1
+  fi
+
+  txt=$(resolve_txt "$fallback_host")
+  endpoint=$(parse_natmap_endpoint "$txt") || return 1
+  printf 'NATMAP_V4|%s\n' "$endpoint"
+}
+
+# Build a wg-compatible config and choose every dynamic peer before setconf.
+# Endpoint supplies the native-v6 hostname and fixed port; EndpointFallbackTXT
+# enables IPv6-first selection and supplies the NATMap TXT hostname.
+prepare_dynamic_endpoint_config() {
+  input="$1"
+  output="$2"
+  iface="$3"
+  peers="/tmp/wg_${iface}.dynamic-peers"
+  choices="/tmp/wg_${iface}.dynamic-choices"
+  state_file=$(dynamic_endpoint_state_file "$iface")
+
+  awk '
+    { gsub(/\r/, "") }
+    /^\[Peer\]/ { if (peer && pk && ep && fb) print n "|" pk "|" ep "|" fb; peer=1; n++; pk=""; ep=""; fb=""; next }
+    /^\[/ { if (peer && pk && ep && fb) print n "|" pk "|" ep "|" fb; peer=0; next }
+    peer && /^[[:space:]]*PublicKey[[:space:]]*=/ { sub(/^[^=]*=[[:space:]]*/, ""); pk=$0 }
+    peer && /^[[:space:]]*Endpoint[[:space:]]*=/ { sub(/^[^=]*=[[:space:]]*/, ""); ep=$0 }
+    peer && /^[[:space:]]*EndpointFallbackTXT[[:space:]]*=/ { sub(/^[^=]*=[[:space:]]*/, ""); fb=$0 }
+    END { if (peer && pk && ep && fb) print n "|" pk "|" ep "|" fb }
+  ' "$input" > "$peers"
+  : > "$choices"
+
+  while IFS='|' read -r n pubkey endpoint fallback; do
+    [ -n "$n" ] || continue
+    native_host=$(endpoint_host "$endpoint")
+    native_port=$(endpoint_port "$endpoint")
+    choice=$(select_dynamic_candidate "$native_host" "$native_port" "$fallback" "") || {
+      wg_log "$iface" "no usable dynamic endpoint for peer $pubkey"
+      rm -f "$peers" "$choices"
+      return 1
+    }
+    state=${choice%%|*}
+    candidate=${choice#*|}
+    printf '%s|%s|%s|%s|%s|%s|%s\n' "$n" "$pubkey" "$state" "$candidate" "$native_host" "$fallback" "$native_port" >> "$choices"
+  done < "$peers"
+
+  if [ -s "$choices" ]; then
+    awk -F'|' '
+      FILENAME == ARGV[1] { endpoint[$1]=$4; next }
+      /^\[Peer\]/ { peer++; print; next }
+      /^[[:space:]]*EndpointFallbackTXT[[:space:]]*=/ { next }
+      /^[[:space:]]*Endpoint[[:space:]]*=/ && (peer in endpoint) { print "Endpoint = " endpoint[peer]; next }
+      { print }
+    ' "$choices" "$input" > "$output"
+    mkdir -p "$wg_data"
+    awk -F'|' '{ print $2 "|" $3 "|" $4 "|" $5 "|" $6 "|" $7 }' "$choices" > "$state_file"
+  else
+    # Preserve ordinary WireGuard configs byte-for-line when no dynamic peer
+    # is configured (apart from CR normalization already done by the caller).
+    cp "$input" "$output"
+    rm -f "$state_file"
+  fi
+  rm -f "$peers" "$choices"
+}
+
+apply_dynamic_candidate() {
+  iface="$1"
+  pubkey="$2"
+  state="$3"
+  candidate="$4"
+  old_routes=$(endpoint_routes_file "$iface")
+  new_routes="${old_routes}.tmp"
+  candidate_addr=$(endpoint_host "$candidate")
+  family=4
+  is_ipv6 "$candidate_addr" && family=6
+
+  mkdir -p "$wg_data"
+  : > "$new_routes"
+  add_runtime_endpoint_routes "$iface" "$new_routes" 1
+  if ! add_endpoint_route "$family" "$iface" "$candidate_addr" "$new_routes"; then
+    rm -f "$new_routes"
+    return 1
+  fi
+
+  current=$($WG show "$iface" endpoints 2>/dev/null | awk -v key="$pubkey" '$1 == key { print $2; exit }')
+  if [ "$current" != "$candidate" ]; then
+    if ! $WG set "$iface" peer "$pubkey" endpoint "$candidate" 2>>"$log_file"; then
+      rm -f "$new_routes"
+      return 1
+    fi
+    printf '%s %s: %s -> %s (%s)\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$iface" "${current:-(none)}" "$candidate" "$state" >> "$dynamic_endpoint_log"
+  fi
+
+  # Rebuild from live endpoints only after wg accepted the new endpoint, then
+  # remove the old route and publish the route set while holding one lock.
+  : > "$new_routes"
+  add_runtime_endpoint_routes "$iface" "$new_routes" 1
+  delete_stale_endpoint_routes "$old_routes" "$new_routes"
+  mv "$new_routes" "$old_routes"
+}
+
+refresh_dynamic_endpoints() {
+  iface="$1"
+  full_select="$2"
+  state_file=$(dynamic_endpoint_state_file "$iface")
+  [ -f "$state_file" ] || return 0
+  acquire_endpoint_routes_lock "$iface" || return 1
+  updated="${state_file}.tmp"
+  : > "$updated"
+  refresh_failed=0
+
+  while IFS='|' read -r pubkey old_state old_endpoint native_host fallback_host native_port; do
+    [ -n "$pubkey" ] || continue
+    refresh_state="$old_state"
+    [ "$full_select" = "1" ] && refresh_state=""
+    choice=$(select_dynamic_candidate "$native_host" "$native_port" "$fallback_host" "$refresh_state") || {
+      wg_log "$iface" "dynamic endpoint refresh failed for peer $pubkey; keeping $old_endpoint"
+      refresh_failed=1
+      printf '%s|%s|%s|%s|%s|%s\n' "$pubkey" "$old_state" "$old_endpoint" "$native_host" "$fallback_host" "$native_port" >> "$updated"
+      continue
+    }
+    state=${choice%%|*}
+    candidate=${choice#*|}
+    if apply_dynamic_candidate "$iface" "$pubkey" "$state" "$candidate"; then
+      printf '%s|%s|%s|%s|%s|%s\n' "$pubkey" "$state" "$candidate" "$native_host" "$fallback_host" "$native_port" >> "$updated"
+    else
+      wg_log "$iface" "failed to atomically apply dynamic endpoint $candidate for peer $pubkey"
+      refresh_failed=1
+      printf '%s|%s|%s|%s|%s|%s\n' "$pubkey" "$old_state" "$old_endpoint" "$native_host" "$fallback_host" "$native_port" >> "$updated"
+    fi
+  done < "$state_file"
+  mv "$updated" "$state_file"
+  release_endpoint_routes_lock
+  [ "$refresh_failed" = "0" ]
+}
+
 # re-resolve domain endpoints for running interfaces, update if IP changed
 reresolve_dns() {
   filter="$1"
@@ -952,6 +1196,7 @@ reresolve_dns() {
     iface=$(basename "$conf" .conf)
     [ -n "$filter" ] && [ "$filter" != "$iface" ] && continue
     iface_running "$iface" || continue
+    refresh_dynamic_endpoints "$iface" 0
     if ! refresh_endpoint_routes "$conf" "$iface"; then
       wg_log "$iface" "skipping DNS endpoint update because endpoint routes could not be locked"
       continue
@@ -960,11 +1205,12 @@ reresolve_dns() {
     # parse each peer's public key and endpoint from conf
     awk '
       { gsub(/\r/, "") }
-      /^\[Peer\]/       { peer=1; pk=""; ep=""; next }
-      /^\[/             { if(peer && pk && ep) print pk " " ep; peer=0; next }
+      /^\[Peer\]/       { peer=1; pk=""; ep=""; fb=""; next }
+      /^\[/             { if(peer && pk && ep && !fb) print pk " " ep; peer=0; next }
       peer && /^[[:space:]]*PublicKey/  { gsub(/.*= */, ""); pk=$0 }
       peer && /^[[:space:]]*Endpoint/  { gsub(/.*= */, ""); ep=$0 }
-      END { if(peer && pk && ep) print pk " " ep }
+      peer && /^[[:space:]]*EndpointFallbackTXT/ { fb=1 }
+      END { if(peer && pk && ep && !fb) print pk " " ep }
     ' "$conf" | while read -r pubkey endpoint; do
       # split host:port — skip if endpoint is already a raw IP
       host=$(endpoint_host "$endpoint")

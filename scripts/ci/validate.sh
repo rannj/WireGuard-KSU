@@ -9,6 +9,7 @@ uninstall.sh
 wgksu
 tests/test_endpoint_route_locks.sh
 tests/test_boot_start.sh
+tests/test_dynamic_endpoint.sh
 tests/helpers/busybox
 tests/helpers/busybox-no-flock
 tests/helpers/delayed-wgksu-holder
@@ -17,6 +18,7 @@ scripts/ci/validate.sh
 scripts/ci/build-wg.sh
 scripts/ci/package-module.sh
 scripts/ci/verify-package.sh
+scripts/natmap-notify-cloudflare.sh
 "
 
 for script in $scripts; do
@@ -26,3 +28,4 @@ done
 
 sh tests/test_endpoint_route_locks.sh
 sh tests/test_boot_start.sh
+sh tests/test_dynamic_endpoint.sh

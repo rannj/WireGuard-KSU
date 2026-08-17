@@ -129,6 +129,39 @@ wg genkey | tee privatekey | wg pubkey > publickey
 - 内核需要 `CONFIG_WIREGUARD=y`（Linux 5.6+）
 - arm64 设备
 
+## IPv6 优先 / NATMap IPv4 回退 Endpoint
+
+在 Peer 中保留标准 `Endpoint` 作为原生 IPv6 域名和固定 WireGuard 端口，再增加 `EndpointFallbackTXT`：
+
+```ini
+[Peer]
+PublicKey = SERVER_PUBLIC_KEY
+Endpoint = ipv6.rannj.top:51820
+EndpointFallbackTXT = ipv4.rannj.top
+AllowedIPs = 10.0.0.0/24
+PersistentKeepalive = 25
+```
+
+`EndpointFallbackTXT` 存在时会启用动态选择。启动或底层默认网络变化时，模块先用短超时执行 `ping -6 ipv6.rannj.top`；成功后解析 AAAA，并进入 `NATIVE_V6`。失败时读取 `ipv4.rannj.top` 的 TXT，要求内容严格为 `IPv4:port`（例如 `203.0.113.7:45678`），并进入 `NATMAP_V4`。优先级始终为 `NATIVE_V6 > NATMAP_V4`。
+
+周期刷新沿用原 DNS re-resolve 间隔：`NATIVE_V6` 重新解析 AAAA，`NATMAP_V4` 重新读取 TXT。Endpoint 比较包含地址和端口。切换时会先钉扎新 Endpoint 的物理 host route，再调用 `wg set peer ... endpoint ...`，成功后才删除旧 route。状态保存在 `/data/adb/wireguard/dynamic-endpoint.<接口>`，变更日志位于 `dynamic-endpoint.log`。
+
+隧道的 `AllowedIPs` 应只包含需要访问的家庭内网 IPv4 网段，不要配置 `0.0.0.0/0` 或 `::/0`；这样 IPv6 探测和 WireGuard 外层流量均走底层网络。
+
+### OpenWrt NATMap TXT 更新脚本
+
+仓库中的 `scripts/natmap-notify-cloudflare.sh` 接收 NATMap 官方的 notify 参数，其中 `$1` 为公网地址、`$2` 为公网端口，并把 TXT 写成无空格的 `IPv4:port`。第一版使用 Cloudflare DNS API。在 OpenWrt 创建 `/etc/natmap-wireguard.conf`：
+
+```sh
+CF_API_TOKEN='仅允许编辑该 Zone DNS 的 API Token'
+CF_ZONE_ID='Cloudflare Zone ID'
+CF_DNS_RECORD_ID='ipv4.rannj.top 这条 TXT 的 Record ID'
+CF_RECORD_NAME='ipv4.rannj.top'
+CF_TTL=60
+```
+
+把脚本复制到 OpenWrt（例如 `/usr/bin/natmap-notify-wireguard`）、设置 `chmod 700`，并作为 NATMap 的 `-e` 脚本。NATMap 会按 `{public-addr} {public-port} {ip4p} {private-port} {protocol} {private-addr}` 调用它。脚本依赖 `curl`，配置文件建议设为 `chmod 600`。
+
 ## License
 
 本项目（模块脚本、WebUI）采用 [MIT License](LICENSE)。

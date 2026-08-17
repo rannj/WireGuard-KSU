@@ -5,6 +5,9 @@ DNS = 1.1.1.1
 
 [Peer]
 PublicKey = SERVER_PUBLIC_KEY_HERE
-Endpoint = YOUR_SERVER_IP:51820
+# IPv6-first dynamic endpoint. The port below is the fixed WireGuard port used
+# with the AAAA address; the TXT record contains the full NATMap IPv4:port.
+Endpoint = ipv6.rannj.top:51820
+EndpointFallbackTXT = ipv4.rannj.top
 AllowedIPs = 10.0.0.0/24
 PersistentKeepalive = 25
