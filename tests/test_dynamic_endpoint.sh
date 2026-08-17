@@ -7,9 +7,11 @@ test_tmp=$(mktemp -d)
 trap 'rm -rf "$test_tmp"' 0 1 2 15
 
 # Loading with a non-command leaves the production functions available.
-# shellcheck disable=SC1090
 busybox=busybox
-. "$repo_dir/wgksu" __test_source__ >/dev/null
+export busybox
+set -- __test_source__
+# shellcheck disable=SC1091
+. "$repo_dir/wgksu" >/dev/null
 wg_data="$test_tmp/data"
 mkdir -p "$wg_data"
 
@@ -18,13 +20,18 @@ fail() {
   exit 1
 }
 
+# These replace functions loaded dynamically from wgksu.
+# shellcheck disable=SC2317
 probe_native_ipv6() { return 0; }
+# shellcheck disable=SC2317
 resolve_host6() { echo '2001:db8::10'; }
+# shellcheck disable=SC2317
 resolve_txt() { echo '198.51.100.20:45678'; }
 
 choice=$(select_dynamic_candidate ipv6.rannj.top 51820 ipv4.rannj.top "")
 [ "$choice" = 'NATIVE_V6|[2001:db8::10]:51820' ] || fail "unexpected IPv6 choice: $choice"
 
+# shellcheck disable=SC2317
 probe_native_ipv6() { return 1; }
 choice=$(select_dynamic_candidate ipv6.rannj.top 51820 ipv4.rannj.top "")
 [ "$choice" = 'NATMAP_V4|198.51.100.20:45678' ] || fail "unexpected NATMap choice: $choice"
